@@ -200,13 +200,86 @@ def handle_approval(action, row_data, final_buy, final_sell, quantity):
         st.toast(f"Rejected {row_data['symbol']}")
         st.session_state.current_row_index += 1
 
-# --- Main App ---
+# --- Order Book Logic (New) ---
 
+def fetch_and_display_orders(kite):
+    st.title("📒 Daily Order Book")
+    
+    with st.spinner("Fetching orders and live prices..."):
+        try:
+            orders = kite.orders()
+            if not orders:
+                st.info("No orders placed today.")
+                return
+
+            # 1. Prepare list for LTP fetch
+            unique_instruments = set()
+            for order in orders:
+                exchange = order.get('exchange', 'NSE')
+                symbol = order.get('tradingsymbol')
+                unique_instruments.add(f"{exchange}:{symbol}")
+            
+            # 2. Fetch LTPs in Batch
+            ltp_map = {}
+            if unique_instruments:
+                try:
+                    ltp_response = kite.ltp(list(unique_instruments))
+                    for key, value in ltp_response.items():
+                        ltp_map[key] = value.get('last_price', 0.0)
+                except Exception as e:
+                    st.error(f"Error fetching LTPs: {e}")
+
+            # 3. Process orders for display
+            display_data = []
+            for order in orders:
+                exchange = order.get('exchange', 'NSE')
+                symbol = order.get('tradingsymbol')
+                instrument_key = f"{exchange}:{symbol}"
+                
+                # Format Status for better UI
+                status = order.get('status')
+                
+                display_data.append({
+                    "Time": order.get('order_timestamp'),
+                    "Symbol": symbol,
+                    "Type": order.get('transaction_type'), # BUY/SELL
+                    "Status": status,
+                    "Qty": f"{order.get('filled_quantity', 0)}/{order.get('quantity', 0)}",
+                    "Order Price": order.get('price', 0), # Limit Price
+                    "LTP": ltp_map.get(instrument_key, 0.0)
+                })
+            
+            # 4. Display DataFrame
+            df = pd.DataFrame(display_data)
+            
+            # Sorting by Time (Newest First)
+            if not df.empty and "Time" in df.columns:
+                df = df.sort_values(by="Time", ascending=False)
+
+            st.dataframe(
+                df,
+                column_config={
+                    "Time": st.column_config.DatetimeColumn("Time", format="HH:mm:ss"),
+                    "LTP": st.column_config.NumberColumn("Current Price", format="₹%.2f"),
+                    "Order Price": st.column_config.NumberColumn("Order Price", format="₹%.2f"),
+                    "Status": st.column_config.TextColumn("Status"),
+                },
+                use_container_width=True,
+                hide_index=True
+            )
+            
+            if st.button("🔄 Refresh Status"):
+                st.rerun()
+
+        except Exception as e:
+            st.error(f"Failed to fetch orders: {e}")
+
+# --- Main App ---
 
 def main():
     # Auto-login check
     if not st.session_state.is_logged_in:
-        if not st.query_params.get("request_token"):# Scanner state
+        if not st.query_params.get("request_token"):
             if load_session_from_disk():
                 st.rerun()
 
@@ -224,182 +297,154 @@ def main():
             st.success(f"User: {user.get('user_name')}")
             st.divider()
             
-            # --- Configuration Sidebar ---
-            st.header("1. Settings")
-            scan_date = st.date_input("Select Date", value=date.today())
-            metric_type = st.selectbox("Select Metric", ["ATR", "True Range"])
-            multiplier = st.number_input("Multiplier", value=1.5, step=0.1)
-            
+            # --- Sidebar Navigation ---
+            page = st.sidebar.radio("Navigation", ["Scanner", "Order Book"])
             st.divider()
-            
-            # Button to fetch data (Restarts the flow)
-            if st.button("Fetch & Select Stocks", type="primary"):
-                results = fetch_scanner_results(scan_date)
-                if results:
-                    st.session_state.scanner_data = results
-                    st.session_state.selection_done = False # Reset to allow selection
-                    st.session_state.current_row_index = 0
-                    st.success(f"Fetched {len(results)} records.")
-                    st.rerun()
-                else:
-                    st.warning("No data found for this date.")
 
+            if page == "Scanner":
+                # --- Scanner Configuration ---
+                st.header("⚙️ Scanner Settings")
+                scan_date = st.date_input("Select Date", value=date.today())
+                metric_type = st.selectbox("Select Metric", ["ATR", "True Range"])
+                multiplier = st.number_input("Multiplier", value=1.5, step=0.1)
+                
+                st.write("")
+                if st.button("Fetch & Select Stocks", type="primary"):
+                    results = fetch_scanner_results(scan_date)
+                    if results:
+                        st.session_state.scanner_data = results
+                        st.session_state.selection_done = False # Reset to allow selection
+                        st.session_state.current_row_index = 0
+                        st.success(f"Fetched {len(results)} records.")
+                        st.rerun()
+                    else:
+                        st.warning("No data found for this date.")
+
+            elif page == "Order Book":
+                st.info("Check status of today's orders.")
+
+            st.divider()
             if st.button("Logout"):
                 logout()
 
-        # --- Main Content Area ---
-        st.title("📋 Scanner Dashboard")
-
-        # VIEW 1: SELECTION TABLE (If selection is NOT done yet)
-        if not st.session_state.selection_done:
-            if st.session_state.scanner_data:
-                st.markdown("### Step 2: Select Stocks to Review")
-                st.info("Check the boxes for the stocks you want to process in the Approval Dashboard.")
-                
-                # Convert to DF for Data Editor
-                df = pd.DataFrame(st.session_state.scanner_data)
-                
-                # Add a 'Select' column initialized to False
-                if "Select" not in df.columns:
-                    df.insert(0, "Select", False)
-
-                # Show Data Editor
-                edited_df = st.data_editor(
-                    df,
-                    column_config={
-                        "Select": st.column_config.CheckboxColumn(
-                            "Select",
-                            help="Select to review this stock",
-                            default=False,
-                        ),
-                        "symbol": "Symbol",
-                        "rationale": "Rationale",
-                        "atr_14": st.column_config.NumberColumn("ATR 14", format="%.2f"),
-                        "true_range": st.column_config.NumberColumn("True Range", format="%.2f"),
-                    },
-                    hide_index=True,
-                    use_container_width=True
-                )
-
-                # Proceed Button
-                col1, col2 = st.columns([1, 4])
-                with col1:
-                    if st.button("Proceed ➡️", type="primary"):
-                        # Filter rows where 'Select' is True
-                        selected_rows = edited_df[edited_df["Select"] == True]
-                        
-                        if not selected_rows.empty:
-                            # Convert back to list of dicts for the logic
-                            # Drop the 'Select' column before saving state
-                            clean_data = selected_rows.drop(columns=["Select"]).to_dict("records")
-                            st.session_state.selected_scanner_data = clean_data
-                            st.session_state.selection_done = True
-                            st.rerun()
-                        else:
-                            st.error("Please select at least one stock to proceed.")
-            else:
-                st.info("👈 Use the sidebar to fetch scanner results.")
-
-        # VIEW 2: APPROVAL DASHBOARD (If selection IS done)
-        else:
-            rows = st.session_state.selected_scanner_data
-            idx = st.session_state.current_row_index
+        # --- Page Routing ---
+        
+        if page == "Order Book":
+            fetch_and_display_orders(kite)
             
-            # Back Button
-            if st.button("⬅️ Back to Selection List"):
-                reset_selection()
-                st.rerun()
+        elif page == "Scanner":
+            st.title("📋 Scanner Dashboard")
 
-            if rows and idx < len(rows):
-                current_row = rows[idx]
-                symbol = current_row['symbol']
-                
-                # 1. Fetch Live Price (LTP) and Open Price
-                ltp, open_price = get_ohlc_data(kite, symbol)
-                
-                # 2. Calculate Metric Targets
-                metric_base_val = 0.0
-                if metric_type == "ATR":
-                    metric_base_val = float(current_row.get("atr_14", 0))
+            # VIEW 1: SELECTION TABLE (If selection is NOT done yet)
+            if not st.session_state.selection_done:
+                if st.session_state.scanner_data:
+                    st.markdown("### Step 2: Select Stocks to Review")
+                    st.info("Check the boxes for the stocks you want to process in the Approval Dashboard.")
+                    
+                    df = pd.DataFrame(st.session_state.scanner_data)
+                    if "Select" not in df.columns:
+                        df.insert(0, "Select", False)
+
+                    edited_df = st.data_editor(
+                        df,
+                        column_config={
+                            "Select": st.column_config.CheckboxColumn("Select", default=False),
+                            "symbol": "Symbol",
+                            "rationale": "Rationale",
+                            "atr_14": st.column_config.NumberColumn("ATR 14", format="%.2f"),
+                            "true_range": st.column_config.NumberColumn("True Range", format="%.2f"),
+                        },
+                        hide_index=True,
+                        use_container_width=True
+                    )
+
+                    col1, col2 = st.columns([1, 4])
+                    with col1:
+                        if st.button("Proceed ➡️", type="primary"):
+                            selected_rows = edited_df[edited_df["Select"] == True]
+                            if not selected_rows.empty:
+                                clean_data = selected_rows.drop(columns=["Select"]).to_dict("records")
+                                st.session_state.selected_scanner_data = clean_data
+                                st.session_state.selection_done = True
+                                st.rerun()
+                            else:
+                                st.error("Please select at least one stock to proceed.")
                 else:
-                    metric_base_val = float(current_row.get("true_range", 0))
-                    
-                delta = metric_base_val * multiplier
-                calc_buy = open_price + delta
-                calc_sell = open_price - delta
+                    st.info("👈 Use the sidebar to fetch scanner results.")
 
-                # 3. Display Interface
-                st.progress((idx) / len(rows), text=f"Reviewing {idx + 1} of {len(rows)}")
-
-                with st.container(border=True):
-                    # Header Row
-                    col_head1, col_head2, col_head3 = st.columns([2, 1, 1])
-                    with col_head1:
-                        st.markdown(f"## {symbol}")
-                        st.caption(f"Rationale: {current_row.get('rationale', 'N/A')}")
-                    with col_head2:
-                        st.metric("LTP", f"₹{ltp}")
-                    with col_head3:
-                        st.metric("Open Price", f"₹{open_price}")
-
-                    st.divider()
-
-                    # Metrics Display
-                    c_m1, c_m2 = st.columns(2)
-                    with c_m1:
-                        st.info(f"**{metric_type}:** {metric_base_val:.2f}")
-                    with c_m2:
-                        st.info(f"**Multiplier:** x{multiplier}")
-
-                    st.markdown("### 🎯 Order Details")
-                    
-                    # Editable Inputs: Quantity | BUY | SELL
-                    c_input1, c_input2, c_input3 = st.columns(3)
-                    
-                    with c_input1:
-                        quantity = st.number_input(
-                            "Quantity",
-                            min_value=1,
-                            value=1,
-                            step=1,
-                            key=f"qty_{idx}"
-                        )
-
-                    with c_input2:
-                        final_buy_price = st.number_input(
-                            "BUY Price (Open + Delta)", 
-                            value=float(f"{calc_buy:.2f}"),
-                            step=0.05,
-                            key=f"buy_{idx}"
-                        )
-                    
-                    with c_input3:
-                        final_sell_price = st.number_input(
-                            "SELL Price (Open - Delta)", 
-                            value=float(f"{calc_sell:.2f}"),
-                            step=0.05,
-                            key=f"sell_{idx}"
-                        )
-
-                # 4. Action Buttons
-                st.write("") 
-                col_reject, col_approve = st.columns(2)
+            # VIEW 2: APPROVAL DASHBOARD (If selection IS done)
+            else:
+                rows = st.session_state.selected_scanner_data
+                idx = st.session_state.current_row_index
                 
-                with col_reject:
-                    if st.button("❌ Reject", use_container_width=True):
-                        handle_approval("REJECTED", current_row, final_buy_price, final_sell_price, quantity)
-                        st.rerun()
-                
-                with col_approve:
-                    if st.button("✅ Approve", type="primary", use_container_width=True):
-                        handle_approval("APPROVED", current_row, final_buy_price, final_sell_price, quantity)
-                        st.rerun()
-
-            elif rows and idx >= len(rows):
-                st.success("🎉 Selected items reviewed!")
-                if st.button("Start Over"):
+                if st.button("⬅️ Back to Selection List"):
                     reset_selection()
                     st.rerun()
+
+                if rows and idx < len(rows):
+                    current_row = rows[idx]
+                    symbol = current_row['symbol']
+                    
+                    ltp, open_price = get_ohlc_data(kite, symbol)
+                    
+                    metric_base_val = 0.0
+                    if metric_type == "ATR":
+                        metric_base_val = float(current_row.get("atr_14", 0))
+                    else:
+                        metric_base_val = float(current_row.get("true_range", 0))
+                        
+                    delta = metric_base_val * multiplier
+                    calc_buy = open_price + delta
+                    calc_sell = open_price - delta
+
+                    st.progress((idx) / len(rows), text=f"Reviewing {idx + 1} of {len(rows)}")
+
+                    with st.container(border=True):
+                        col_head1, col_head2, col_head3 = st.columns([2, 1, 1])
+                        with col_head1:
+                            st.markdown(f"## {symbol}")
+                            st.caption(f"Rationale: {current_row.get('rationale', 'N/A')}")
+                        with col_head2:
+                            st.metric("LTP", f"₹{ltp}")
+                        with col_head3:
+                            st.metric("Open Price", f"₹{open_price}")
+
+                        st.divider()
+
+                        c_m1, c_m2 = st.columns(2)
+                        with c_m1:
+                            st.info(f"**{metric_type}:** {metric_base_val:.2f}")
+                        with c_m2:
+                            st.info(f"**Multiplier:** x{multiplier}")
+
+                        st.markdown("### 🎯 Order Details")
+                        
+                        c_input1, c_input2, c_input3 = st.columns(3)
+                        with c_input1:
+                            quantity = st.number_input("Quantity", min_value=1, value=1, step=1, key=f"qty_{idx}")
+                        with c_input2:
+                            final_buy_price = st.number_input("BUY Price (Open + Delta)", value=float(f"{calc_buy:.2f}"), step=0.05, key=f"buy_{idx}")
+                        with c_input3:
+                            final_sell_price = st.number_input("SELL Price (Open - Delta)", value=float(f"{calc_sell:.2f}"), step=0.05, key=f"sell_{idx}")
+
+                    st.write("") 
+                    col_reject, col_approve = st.columns(2)
+                    
+                    with col_reject:
+                        if st.button("❌ Reject", use_container_width=True):
+                            handle_approval("REJECTED", current_row, final_buy_price, final_sell_price, quantity)
+                            st.rerun()
+                    
+                    with col_approve:
+                        if st.button("✅ Approve", type="primary", use_container_width=True):
+                            handle_approval("APPROVED", current_row, final_buy_price, final_sell_price, quantity)
+                            st.rerun()
+
+                elif rows and idx >= len(rows):
+                    st.success("🎉 Selected items reviewed!")
+                    if st.button("Start Over"):
+                        reset_selection()
+                        st.rerun()
 
     # ---------------------------------------------------------
     # PART 2: LOGIN FLOW
@@ -434,7 +479,6 @@ def main():
                     st.session_state.user_api_secret = api_secret
                     kite = KiteConnect(api_key=api_key)
                     st.link_button("Login with Zerodha", kite.login_url(), type="primary")
-
 
 if __name__ == "__main__":
     main()

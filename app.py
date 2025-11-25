@@ -7,6 +7,7 @@ import os
 import time
 import pandas as pd
 from datetime import datetime, date
+from kite_utils import place_buy_order, place_sell_order
 
 # --- Configuration ---
 st.set_page_config(page_title="15 Minutes Scanner Approval", page_icon="✅")
@@ -122,7 +123,7 @@ def fetch_scanner_results(selected_date):
     except Exception as e:
         st.error(f"Supabase Query Error: {e}")
         return []
-
+    
 def get_ohlc_data(kite_client, symbol):
     """Fetches LTP and Open price for a given symbol from NSE."""
     try:
@@ -140,65 +141,46 @@ def get_ohlc_data(kite_client, symbol):
         st.error(f"Could not fetch data for {symbol}: {e}")
         return 0.0, 0.0
     
-def place_buy_and_sell(kite: KiteConnect, trade: dict):
-    symbol = trade["symbol"]
-    qty    = trade["qty"]
-    
-    try:
-        # 1. BUY order (MIS + Limit)
-        buy_id = kite.place_order(
-            variety=kite.VARIETY_REGULAR,
-            exchange=kite.EXCHANGE_NSE,
-            tradingsymbol=symbol,
-            transaction_type=kite.TRANSACTION_TYPE_BUY,
-            quantity=qty,
-            product=kite.PRODUCT_MIS,
-            order_type=kite.ORDER_TYPE_LIMIT,
-            price=trade["buy_price"],
-            validity=kite.VALIDITY_DAY
-        )
-        print(f"{symbol} | BUY placed  @ {trade['buy_price']} | ID: {buy_id}")
-
-        # 2. SELL order (MIS + Limit) – placed immediately
-        sell_id = kite.place_order(
-            variety=kite.VARIETY_REGULAR,
-            exchange=kite.EXCHANGE_NSE,
-            tradingsymbol=symbol,
-            transaction_type=kite.TRANSACTION_TYPE_SELL,
-            quantity=qty,
-            product=kite.PRODUCT_MIS,
-            order_type=kite.ORDER_TYPE_LIMIT,
-            price=trade["sell_price"],
-            validity=kite.VALIDITY_DAY
-        )
-        print(f"{symbol} | SELL placed @ {trade['sell_price']} | ID: {sell_id}")
-
-    except Exception as e:
-        print(f"Failed for {symbol}: {e}")
-        raise e
+def reset_selection():
+    """Resets the workflow to the selection phase."""
+    st.session_state.selection_done = False
+    st.session_state.selected_scanner_data = []
+    st.session_state.current_row_index = 0
 
 def handle_approval(action, row_data, final_buy, final_sell, quantity):
     """Handles the approve/reject logic with the edited prices."""
     kite = KiteConnect(api_key=st.session_state.user_api_key)
     kite.set_access_token(st.session_state.access_token)
     
-    if action == "APPROVED":
-        try:
-            place_buy_and_sell(kite, {
-                "symbol": row_data["symbol"],
-                "qty": quantity,
-                "buy_price": final_buy,
-                "sell_price": final_sell
-            })
-            st.toast(f"Approved {row_data['symbol']} @ Buy: {final_buy} / Sell: {final_sell}", duration='long')
+    try:
+        if action == "BUY":
+            place_buy_order(kite, row_data['symbol'], final_buy, quantity)
+            st.toast(f"Approved {row_data['symbol']} @ Buy: {final_buy}", duration='long')
             time.sleep(2.0)
             st.session_state.current_row_index += 1
-        except Exception as e:
-            st.toast(f"Failed to place order for {row_data['symbol']}: {e}", duration='long')
+        
+        elif action == "SELL":
+            place_sell_order(kite, row_data['symbol'], final_sell, quantity)
+            st.toast(f"Approved {row_data['symbol']} @ Sell: {final_sell}", duration='long')
             time.sleep(2.0)
-    else:
-        st.toast(f"Rejected {row_data['symbol']}")
-        st.session_state.current_row_index += 1
+            st.session_state.current_row_index += 1
+        
+        elif action == "BOTH":
+            place_buy_order(kite, row_data['symbol'], final_buy, quantity)
+            st.toast(f"Approved {row_data['symbol']} @ Buy: {final_buy}", duration='long')
+            
+            place_sell_order(kite, row_data['symbol'], final_sell, quantity)
+            st.toast(f"Approved {row_data['symbol']} @ Sell: {final_sell}", duration='long')
+            
+            time.sleep(2.0)
+            st.session_state.current_row_index += 1
+        else:
+            st.session_state.current_row_index += 1
+
+    except Exception as e:
+        st.toast(f"Failed to place order for {row_data['symbol']}: {e}", duration='long')
+        time.sleep(2.0)
+
 
 # --- Order Book Logic (New) ---
 
@@ -305,7 +287,7 @@ def main():
                 # --- Scanner Configuration ---
                 st.header("⚙️ Scanner Settings")
                 scan_date = st.date_input("Select Date", value=date.today())
-                metric_type = st.selectbox("Select Metric", ["ATR", "True Range"])
+                # Only multiplier input remains
                 multiplier = st.number_input("Multiplier", value=1.5, step=0.1)
                 
                 st.write("")
@@ -345,13 +327,13 @@ def main():
                     if "Select" not in df.columns:
                         df.insert(0, "Select", False)
 
+                    # Removed atr_14 from config
                     edited_df = st.data_editor(
                         df,
                         column_config={
                             "Select": st.column_config.CheckboxColumn("Select", default=False),
                             "symbol": "Symbol",
                             "rationale": "Rationale",
-                            "atr_14": st.column_config.NumberColumn("ATR 14", format="%.2f"),
                             "true_range": st.column_config.NumberColumn("True Range", format="%.2f"),
                         },
                         hide_index=True,
@@ -387,11 +369,8 @@ def main():
                     
                     ltp, open_price = get_ohlc_data(kite, symbol)
                     
-                    metric_base_val = 0.0
-                    if metric_type == "ATR":
-                        metric_base_val = float(current_row.get("atr_14", 0))
-                    else:
-                        metric_base_val = float(current_row.get("true_range", 0))
+                    # Always use True Range
+                    metric_base_val = float(current_row.get("true_range", 0))
                         
                     delta = metric_base_val * multiplier
                     calc_buy = open_price + delta
@@ -413,7 +392,7 @@ def main():
 
                         c_m1, c_m2 = st.columns(2)
                         with c_m1:
-                            st.info(f"**{metric_type}:** {metric_base_val:.2f}")
+                            st.info(f"**True Range:** {metric_base_val:.2f}")
                         with c_m2:
                             st.info(f"**Multiplier:** x{multiplier}")
 
@@ -428,16 +407,28 @@ def main():
                             final_sell_price = st.number_input("SELL Price (Open - Delta)", value=float(f"{calc_sell:.2f}"), step=0.05, key=f"sell_{idx}")
 
                     st.write("") 
-                    col_reject, col_approve = st.columns(2)
                     
-                    with col_reject:
-                        if st.button("❌ Reject", use_container_width=True):
-                            handle_approval("REJECTED", current_row, final_buy_price, final_sell_price, quantity)
+                    # --- BUTTON LAYOUT ---
+                    c_b1, c_b2, c_b3, c_b4 = st.columns(4)
+                    
+                    with c_b1:
+                        if st.button("🔵 BUY Only", use_container_width=True):
+                            handle_approval("BUY", current_row, final_buy_price, final_sell_price, quantity)
                             st.rerun()
                     
-                    with col_approve:
-                        if st.button("✅ Approve", type="primary", use_container_width=True):
-                            handle_approval("APPROVED", current_row, final_buy_price, final_sell_price, quantity)
+                    with c_b2:
+                        if st.button("🔴 SELL Only", use_container_width=True):
+                            handle_approval("SELL", current_row, final_buy_price, final_sell_price, quantity)
+                            st.rerun()
+
+                    with c_b3:
+                        if st.button("🟣 BUY & SELL", use_container_width=True):
+                            handle_approval("BOTH", current_row, final_buy_price, final_sell_price, quantity)
+                            st.rerun()
+
+                    with c_b4:
+                        if st.button("⏭️ SKIP", use_container_width=True):
+                            handle_approval("SKIP", current_row, final_buy_price, final_sell_price, quantity)
                             st.rerun()
 
                 elif rows and idx >= len(rows):

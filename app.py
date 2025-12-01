@@ -149,13 +149,16 @@ def get_ohlc_data(kite_client, symbol):
         return 0.0, 0.0
 
 def reset_selection():
-    """Resets the workflow to the selection phase."""
+    """R esets the workflow to the selection phase."""
     st.session_state.selection_done = False
     st.session_state.selected_scanner_data = []
     
 def calculate_quantity_and_finalize(kite_client, selected_data, multiplier, capital, strategy):
     """
     Calculates final prices, quantities, and prepares the data for review.
+    
+    UPDATED: Buy/Sell prices rounded to 1 decimal place (multiple of 0.1).
+    UPDATED: Equal distribution quantity based on Open Price.
     """
     finalized_data = []
     
@@ -163,7 +166,6 @@ def calculate_quantity_and_finalize(kite_client, selected_data, multiplier, capi
     symbols = [row['symbol'] for row in selected_data]
     ohlc_map = {}
     for symbol in symbols:
-        # Fetch data synchronously for simplicity in Streamlit environment
         _, open_price = get_ohlc_data(kite_client, symbol)
         ohlc_map[symbol] = open_price
         
@@ -179,13 +181,14 @@ def calculate_quantity_and_finalize(kite_client, selected_data, multiplier, capi
         metric_base_val = float(row.get("true_range", 0))
         delta = metric_base_val * multiplier
         
-        # Calculate Buy and Sell prices
+        # Calculate raw Buy and Sell prices
         calc_buy = open_price + delta
         calc_sell = open_price - delta
         
-        row['open_price'] = float(f"{open_price:.2f}")
-        row['buy_price'] = float(f"{calc_buy:.2f}")
-        row['sell_price'] = float(f"{calc_sell:.2f}")
+        # Apply rounding to 1 decimal place (multiple of 0.1) as requested
+        row['open_price'] = float(f"{open_price:.2f}") 
+        row['buy_price'] = round(calc_buy, 1) # Rounded to 0.1 precision
+        row['sell_price'] = round(calc_sell, 1) # Rounded to 0.1 precision
         finalized_data.append(row)
 
     if not finalized_data:
@@ -204,9 +207,8 @@ def calculate_quantity_and_finalize(kite_client, selected_data, multiplier, capi
                 # Calculate budget per stock
                 budget_per_stock = capital / num_stocks
                 
-                # Determine the maximum capital exposure per unit (conservative)
-                # Max of Open Price, Buy Price, or Sell Price magnitude
-                price_proxy = max(row['buy_price'], row['open_price'])
+                # Use Open Price as the basis for quantity calculation (Requested change)
+                price_proxy = row['open_price'] 
                 
                 if price_proxy > 0:
                     quantity = math.floor(budget_per_stock / price_proxy)
@@ -449,7 +451,6 @@ def main():
                     # Ensure Action column exists for the dropdown
                     if "Action" not in df.columns:
                         df.insert(0, "Action", "SKIP")
-                    # Ensure true_range is visible for context on the metric
                     
                     edited_df = st.data_editor(
                         df,
@@ -519,8 +520,9 @@ def main():
                         "symbol": "Symbol",
                         "Action": "Action",
                         "open_price": st.column_config.NumberColumn("Open Price", format="₹%.2f"),
-                        "buy_price": st.column_config.NumberColumn("BUY Price", format="₹%.2f"),
-                        "sell_price": st.column_config.NumberColumn("SELL Price", format="₹%.2f"),
+                        # Ensure display format matches the new 0.1 precision
+                        "buy_price": st.column_config.NumberColumn("BUY Price", format="₹%.1f"), 
+                        "sell_price": st.column_config.NumberColumn("SELL Price", format="₹%.1f"),
                         "quantity": st.column_config.NumberColumn("Quantity", format="%d"),
                     },
                     hide_index=True,

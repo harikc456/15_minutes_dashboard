@@ -29,7 +29,7 @@ if "selection_done" not in st.session_state:
 if "capital" not in st.session_state:
     st.session_state.capital = 100000
 if "capital_strategy" not in st.session_state:
-    st.session_state.capital_strategy = "Equal distribution"
+    st.session_state.capital_strategy = "One each"
 
 # --- Supabase Initialization ---
 @st.cache_resource

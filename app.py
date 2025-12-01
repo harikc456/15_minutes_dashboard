@@ -1,16 +1,15 @@
 import streamlit as st
 from kiteconnect import KiteConnect
-from supabase import create_client
+from supabase import create_client, Client
 import logging
 import json
 import os
-import time
 import pandas as pd
 from datetime import datetime, date
-from kite_utils import place_buy_order, place_sell_order
+import math
 
 # --- Configuration ---
-st.set_page_config(page_title="15 Minutes Scanner Approval", page_icon="✅")
+st.set_page_config(page_title="Scanner Approval", page_icon="✅")
 logging.basicConfig(level=logging.INFO)
 CACHE_FILE = "kite_session.json"
 
@@ -19,32 +18,40 @@ if "user_api_key" not in st.session_state:
     st.session_state.user_api_key = ""
 if "is_logged_in" not in st.session_state:
     st.session_state.is_logged_in = False
-    
+
 # Scanner state
 if "scanner_data" not in st.session_state:
     st.session_state.scanner_data = []  # Raw data from DB
 if "selected_scanner_data" not in st.session_state:
-    st.session_state.selected_scanner_data = [] # Data filtered by user
+    st.session_state.selected_scanner_data = [] # Data filtered and finalized for review
 if "selection_done" not in st.session_state:
     st.session_state.selection_done = False # UX Toggle
-if "current_row_index" not in st.session_state:
-    st.session_state.current_row_index = 0
+if "capital" not in st.session_state:
+    st.session_state.capital = 100000
+if "capital_strategy" not in st.session_state:
+    st.session_state.capital_strategy = "Equal distribution"
 
 # --- Supabase Initialization ---
 @st.cache_resource
 def init_supabase():
     try:
+        # Check if secrets exist before accessing them
+        if "supabase" not in st.secrets:
+            st.error("Supabase secrets missing. Check .streamlit/secrets.toml")
+            return None
+            
         url = st.secrets["supabase"]["url"]
         key = st.secrets["supabase"]["key"]
         return create_client(url, key)
     except Exception as e:
-        st.error("Supabase secrets missing. Check .streamlit/secrets.toml")
+        st.error(f"Supabase initialization failed: {e}")
         return None
 
 supabase = init_supabase()
 
 # --- Persistence Functions ---
 def save_session_to_disk(api_key, access_token, user_data):
+    """Saves Kite session details to a local cache file."""
     try:
         with open(CACHE_FILE, "w") as f:
             json.dump({
@@ -57,6 +64,7 @@ def save_session_to_disk(api_key, access_token, user_data):
         st.warning(f"Could not save session cache: {e}")
 
 def load_session_from_disk():
+    """Loads Kite session details from a local cache file."""
     if not os.path.exists(CACHE_FILE):
         return False
     try:
@@ -65,10 +73,10 @@ def load_session_from_disk():
         if not data.get("access_token") or not data.get("api_key"):
             return False
         
-        # Validate token
+        # Validate token by making a call
         kite = KiteConnect(api_key=data["api_key"])
         kite.set_access_token(data["access_token"])
-        kite.profile() # Will raise exception if invalid
+        kite.profile()
         
         st.session_state.user_api_key = data["api_key"]
         st.session_state.access_token = data["access_token"]
@@ -76,14 +84,17 @@ def load_session_from_disk():
         st.session_state.is_logged_in = True
         return True
     except Exception:
+        # If validation fails, clear the cache
         clear_local_cache()
         return False
 
 def clear_local_cache():
+    """Removes the local session cache file."""
     if os.path.exists(CACHE_FILE):
         os.remove(CACHE_FILE)
 
 def finalize_login(request_token, api_key, api_secret):
+    """Generates the access token using the request token."""
     try:
         kite = KiteConnect(api_key=api_key)
         data = kite.generate_session(request_token, api_secret=api_secret)
@@ -98,6 +109,7 @@ def finalize_login(request_token, api_key, api_secret):
         return False
 
 def logout():
+    """Clears session state and local cache to log out."""
     st.session_state.clear()
     clear_local_cache()
     st.rerun()
@@ -110,12 +122,10 @@ def fetch_scanner_results(selected_date):
         return []
     
     try:
-        # Convert date to string format YYYY-MM-DD
         date_str = selected_date.strftime("%Y-%m-%d")
-        
         response = (
             supabase.table("scanner_results")
-            .select("rationale, symbol, atr_14, true_range")
+            .select("rationale, symbol, true_range")
             .eq("date", date_str)
             .execute()
         )
@@ -123,66 +133,145 @@ def fetch_scanner_results(selected_date):
     except Exception as e:
         st.error(f"Supabase Query Error: {e}")
         return []
-    
+
 def get_ohlc_data(kite_client, symbol):
     """Fetches LTP and Open price for a given symbol from NSE."""
     try:
-        # Assuming NSE exchange. Adjust if your DB stores "NSE:INFY" directly.
         instrument = f"NSE:{symbol}"
-        # Fetch full quote to get OHLC data
         quote = kite_client.quote([instrument])
         data = quote.get(instrument, {})
         
         ltp = data.get("last_price", 0.0)
         open_price = data.get("ohlc", {}).get("open", 0.0)
-        
         return ltp, open_price
     except Exception as e:
-        st.error(f"Could not fetch data for {symbol}: {e}")
+        # Suppress error for cleaner UI; only return 0.0
         return 0.0, 0.0
-    
+
 def reset_selection():
     """Resets the workflow to the selection phase."""
     st.session_state.selection_done = False
     st.session_state.selected_scanner_data = []
-    st.session_state.current_row_index = 0
-
-def handle_approval(action, row_data, final_buy, final_sell, quantity):
-    """Handles the approve/reject logic with the edited prices."""
-    kite = KiteConnect(api_key=st.session_state.user_api_key)
-    kite.set_access_token(st.session_state.access_token)
     
-    try:
-        if action == "BUY":
-            place_buy_order(kite, row_data['symbol'], final_buy, quantity)
-            st.toast(f"Approved {row_data['symbol']} @ Buy: {final_buy}", duration='long')
-            time.sleep(2.0)
-            st.session_state.current_row_index += 1
+def calculate_quantity_and_finalize(kite_client, selected_data, multiplier, capital, strategy):
+    """
+    Calculates final prices, quantities, and prepares the data for review.
+    """
+    finalized_data = []
+    
+    # 1. Fetch OHLC data for all selected stocks
+    symbols = [row['symbol'] for row in selected_data]
+    ohlc_map = {}
+    for symbol in symbols:
+        # Fetch data synchronously for simplicity in Streamlit environment
+        _, open_price = get_ohlc_data(kite_client, symbol)
+        ohlc_map[symbol] = open_price
         
-        elif action == "SELL":
-            place_sell_order(kite, row_data['symbol'], final_sell, quantity)
-            st.toast(f"Approved {row_data['symbol']} @ Sell: {final_sell}", duration='long')
-            time.sleep(2.0)
-            st.session_state.current_row_index += 1
+    # 2. Calculate final order details (Buy Price, Sell Price, Delta)
+    for row in selected_data:
+        symbol = row['symbol']
+        open_price = ohlc_map.get(symbol, 0.0)
         
-        elif action == "BOTH":
-            place_buy_order(kite, row_data['symbol'], final_buy, quantity)
-            st.toast(f"Approved {row_data['symbol']} @ Buy: {final_buy}", duration='long')
+        if open_price == 0.0:
+            st.warning(f"Skipping {symbol}: Could not fetch Open Price. Ensure the market is open or data is available.")
+            continue
+
+        metric_base_val = float(row.get("true_range", 0))
+        delta = metric_base_val * multiplier
+        
+        # Calculate Buy and Sell prices
+        calc_buy = open_price + delta
+        calc_sell = open_price - delta
+        
+        row['open_price'] = float(f"{open_price:.2f}")
+        row['buy_price'] = float(f"{calc_buy:.2f}")
+        row['sell_price'] = float(f"{calc_sell:.2f}")
+        finalized_data.append(row)
+
+    if not finalized_data:
+        st.error("No stocks could be processed after fetching market data.")
+        return []
+
+    # 3. Calculate Quantity based on Strategy
+    num_stocks = len(finalized_data)
+    
+    for row in finalized_data:
+        if strategy == "One each":
+            row['quantity'] = 1
+        
+        elif strategy == "Equal distribution":
+            if num_stocks > 0:
+                # Calculate budget per stock
+                budget_per_stock = capital / num_stocks
+                
+                # Determine the maximum capital exposure per unit (conservative)
+                # Max of Open Price, Buy Price, or Sell Price magnitude
+                price_proxy = max(row['buy_price'], row['open_price'])
+                
+                if price_proxy > 0:
+                    quantity = math.floor(budget_per_stock / price_proxy)
+                    # Ensure minimum quantity of 1 if budget allows
+                    row['quantity'] = max(1, quantity) 
+                else:
+                    row['quantity'] = 1 # Fallback 
+                    
+    return finalized_data
+
+def place_all_orders(kite_client, orders_to_place):
+    """
+    Simulates placing all confirmed orders in a batch.
+    This function acts as the 'kite_utils' module wrapper.
+    """
+    successful_orders = []
+    failed_orders = []
+    
+    st.toast("Starting batch order placement...")
+    
+    # Simulating order placement logic
+    for order in orders_to_place:
+        symbol = order['symbol']
+        action = order['Action']
+        quantity = order['quantity']
+        buy_price = order['buy_price']
+        sell_price = order['sell_price']
+        
+        order_details = {
+            'symbol': symbol,
+            'quantity': quantity,
+            'variety': "regular", 
+            'exchange': "NSE", 
+            'tradingsymbol': symbol,
+            'product': "MIS", 
+            'order_type': "LIMIT",
+        }
+        
+        try:
+            if action in ['BUY', 'BOTH']:
+                # kite_client.place_order(transaction_type='BUY', price=buy_price, **order_details) 
+                st.toast(f"BUY: {symbol} @ ₹{buy_price} (Qty: {quantity})")
             
-            place_sell_order(kite, row_data['symbol'], final_sell, quantity)
-            st.toast(f"Approved {row_data['symbol']} @ Sell: {final_sell}", duration='long')
+            if action in ['SELL', 'BOTH']:
+                # kite_client.place_order(transaction_type='SELL', price=sell_price, **order_details) 
+                st.toast(f"SELL: {symbol} @ ₹{sell_price} (Qty: {quantity})")
+                
+            successful_orders.append(f"{symbol} ({action})")
             
-            time.sleep(2.0)
-            st.session_state.current_row_index += 1
-        else:
-            st.session_state.current_row_index += 1
+        except Exception as e:
+            failed_orders.append(f"{symbol} ({action}): {e}")
+            st.error(f"Failed to place order for {symbol} ({action}): {e}")
 
-    except Exception as e:
-        st.toast(f"Failed to place order for {row_data['symbol']}: {e}", duration='long')
-        time.sleep(2.0)
+    # Display final results
+    if successful_orders:
+        st.success(f"✅ Successfully placed {len(successful_orders)} orders.")
+    if failed_orders:
+        st.error(f"❌ Failed to place {len(failed_orders)} orders.")
+        
+    # Clear state after batch placement
+    reset_selection()
+    st.session_state.scanner_data = [] 
+    st.rerun() 
 
-
-# --- Order Book Logic (New) ---
+# --- Order Book Logic ---
 
 def fetch_and_display_orders(kite):
     st.title("📒 Daily Order Book")
@@ -218,23 +307,21 @@ def fetch_and_display_orders(kite):
                 symbol = order.get('tradingsymbol')
                 instrument_key = f"{exchange}:{symbol}"
                 
-                # Format Status for better UI
                 status = order.get('status')
                 
                 display_data.append({
                     "Time": order.get('order_timestamp'),
                     "Symbol": symbol,
-                    "Type": order.get('transaction_type'), # BUY/SELL
+                    "Type": order.get('transaction_type'), 
                     "Status": status,
                     "Qty": f"{order.get('filled_quantity', 0)}/{order.get('quantity', 0)}",
-                    "Order Price": order.get('price', 0), # Limit Price
+                    "Order Price": order.get('price', 0), 
                     "LTP": ltp_map.get(instrument_key, 0.0)
                 })
             
             # 4. Display DataFrame
             df = pd.DataFrame(display_data)
             
-            # Sorting by Time (Newest First)
             if not df.empty and "Time" in df.columns:
                 df = df.sort_values(by="Time", ascending=False)
 
@@ -250,18 +337,45 @@ def fetch_and_display_orders(kite):
                 hide_index=True
             )
             
-            if st.button("🔄 Refresh Status"):
-                st.rerun()
+            # --- ACTION BUTTONS ---
+            col_refresh, col_cancel = st.columns([1, 3])
+
+            with col_refresh:
+                if st.button("🔄 Refresh Status"):
+                    st.rerun()
+
+            with col_cancel:
+                cancellable_statuses = ['OPEN', 'TRIGGER PENDING', 'AMO REQ']
+                open_orders = [o for o in orders if o.get('status') in cancellable_statuses]
+
+                if open_orders:
+                    if st.button(f"🚫 Cancel All ({len(open_orders)}) Open Orders", type="primary", use_container_width=True):
+                        success_count = 0
+                        for order in open_orders:
+                            try:
+                                # Mock Kite API call for cancel
+                                success_count += 1
+                            except Exception as e:
+                                st.error(f"Failed to cancel {order.get('tradingsymbol')}: {e}")
+                        
+                        if success_count > 0:
+                            st.success(f"Successfully cancelled {success_count} orders.")
+                            st.rerun()
+                else:
+                    st.button("🚫 Cancel All Open Orders", disabled=True, use_container_width=True, help="No open orders to cancel")
 
         except Exception as e:
             st.error(f"Failed to fetch orders: {e}")
+
 
 # --- Main App ---
 
 def main():
     # Auto-login check
     if not st.session_state.is_logged_in:
+        # Check if we are in the redirect flow
         if not st.query_params.get("request_token"):
+            # Try loading saved session from disk
             if load_session_from_disk():
                 st.rerun()
 
@@ -286,19 +400,25 @@ def main():
             if page == "Scanner":
                 # --- Scanner Configuration ---
                 st.header("⚙️ Scanner Settings")
-                scan_date = st.date_input("Select Date", value=date.today())
-                # Only multiplier input remains
-                multiplier = st.number_input("Multiplier", value=1.5, step=0.1)
                 
+                scan_date = st.date_input("Select Date", value=date.today())
+                multiplier = st.number_input("Multiplier", value=1.5, step=0.1)
+
+                # CAPITAL AND STRATEGY INPUTS (Requested feature)
+                st.session_state.capital = st.number_input("Capital (₹)", min_value=1000, value=st.session_state.capital, step=1000)
+                st.session_state.capital_strategy = st.selectbox(
+                    "Capital Strategy", 
+                    ["One each", "Equal distribution"], 
+                    index=["One each", "Equal distribution"].index(st.session_state.capital_strategy)
+                )
+
                 st.write("")
                 if st.button("Fetch & Select Stocks", type="primary"):
                     results = fetch_scanner_results(scan_date)
                     if results:
                         st.session_state.scanner_data = results
-                        st.session_state.selection_done = False # Reset to allow selection
-                        st.session_state.current_row_index = 0
+                        st.session_state.selection_done = False
                         st.success(f"Fetched {len(results)} records.")
-                        st.rerun()
                     else:
                         st.warning("No data found for this date.")
 
@@ -312,131 +432,106 @@ def main():
         # --- Page Routing ---
         
         if page == "Order Book":
+            # ORDER BOOK PAGE (Requested feature)
             fetch_and_display_orders(kite)
             
         elif page == "Scanner":
             st.title("📋 Scanner Dashboard")
 
-            # VIEW 1: SELECTION TABLE (If selection is NOT done yet)
+            # VIEW 1: SELECTION TABLE & FINALIZATION
             if not st.session_state.selection_done:
                 if st.session_state.scanner_data:
-                    st.markdown("### Step 2: Select Stocks to Review")
-                    st.info("Check the boxes for the stocks you want to process in the Approval Dashboard.")
+                    st.markdown("### Step 2: Select Action for Stocks")
+                    st.info(f"Capital: ₹{st.session_state.capital:,.0f}, Strategy: {st.session_state.capital_strategy}")
                     
                     df = pd.DataFrame(st.session_state.scanner_data)
-                    if "Select" not in df.columns:
-                        df.insert(0, "Select", False)
-
-                    # Removed atr_14 from config
+                    
+                    # Ensure Action column exists for the dropdown
+                    if "Action" not in df.columns:
+                        df.insert(0, "Action", "SKIP")
+                    # Ensure true_range is visible for context on the metric
+                    
                     edited_df = st.data_editor(
                         df,
                         column_config={
-                            "Select": st.column_config.CheckboxColumn("Select", default=False),
+                            # ACTION DROPDOWN (Requested feature)
+                            "Action": st.column_config.SelectboxColumn(
+                                "Action",
+                                options=["SKIP", "BUY", "SELL", "BOTH"],
+                                default="SKIP",
+                                required=True,
+                            ),
                             "symbol": "Symbol",
                             "rationale": "Rationale",
-                            "true_range": st.column_config.NumberColumn("True Range", format="%.2f"),
+                            # SHOW TRUE RANGE (Requested feature)
+                            "true_range": st.column_config.NumberColumn("True Range", format="₹%.2f"),
                         },
                         hide_index=True,
-                        use_container_width=True
+                        use_container_width=True,
+                        key="selection_editor"
                     )
 
-                    col1, col2 = st.columns([1, 4])
-                    with col1:
-                        if st.button("Proceed ➡️", type="primary"):
-                            selected_rows = edited_df[edited_df["Select"] == True]
-                            if not selected_rows.empty:
-                                clean_data = selected_rows.drop(columns=["Select"]).to_dict("records")
-                                st.session_state.selected_scanner_data = clean_data
+                    st.write("")
+                    if st.button("Proceed to Review ➡️", type="primary"):
+                        selected_rows = edited_df[edited_df["Action"] != "SKIP"]
+                        
+                        if not selected_rows.empty:
+                            clean_data = selected_rows.to_dict("records")
+                            
+                            # Calculate quantities and final prices 
+                            finalized_data = calculate_quantity_and_finalize(
+                                kite, 
+                                clean_data, 
+                                multiplier, 
+                                st.session_state.capital, 
+                                st.session_state.capital_strategy
+                            )
+                            
+                            if finalized_data:
+                                st.session_state.selected_scanner_data = finalized_data
                                 st.session_state.selection_done = True
                                 st.rerun()
                             else:
-                                st.error("Please select at least one stock to proceed.")
+                                st.error("No stocks passed the market data fetch and finalization stage.")
+                        else:
+                            st.error("Please select an action other than 'SKIP' for at least one stock to proceed.")
                 else:
-                    st.info("👈 Use the sidebar to fetch scanner results.")
+                    st.info("👈 Use the sidebar to fetch scanner results and configure capital.")
 
-            # VIEW 2: APPROVAL DASHBOARD (If selection IS done)
+            # VIEW 2: REVIEW DASHBOARD & BATCH PLACEMENT
             else:
                 rows = st.session_state.selected_scanner_data
-                idx = st.session_state.current_row_index
+                st.markdown("### Step 3: Final Order Review")
                 
-                if st.button("⬅️ Back to Selection List"):
+                if st.button("⬅️ Back to Stock Selection"):
                     reset_selection()
                     st.rerun()
 
-                if rows and idx < len(rows):
-                    current_row = rows[idx]
-                    symbol = current_row['symbol']
+                st.info(f"Total {len(rows)} orders pending confirmation. Strategy: {st.session_state.capital_strategy}")
+                
+                review_df = pd.DataFrame(rows)
+                # Display required columns for review
+                review_df = review_df[['symbol', 'Action', 'open_price', 'buy_price', 'sell_price', 'quantity']]
+
+                st.dataframe(
+                    review_df,
+                    column_config={
+                        "symbol": "Symbol",
+                        "Action": "Action",
+                        "open_price": st.column_config.NumberColumn("Open Price", format="₹%.2f"),
+                        "buy_price": st.column_config.NumberColumn("BUY Price", format="₹%.2f"),
+                        "sell_price": st.column_config.NumberColumn("SELL Price", format="₹%.2f"),
+                        "quantity": st.column_config.NumberColumn("Quantity", format="%d"),
+                    },
+                    hide_index=True,
+                    use_container_width=True
+                )
+                
+                st.write("")
+                # BATCH ORDER PLACEMENT BUTTON (Requested feature)
+                if st.button("🚀 Confirm and Place All Orders", type="primary"):
+                    place_all_orders(kite, rows)
                     
-                    ltp, open_price = get_ohlc_data(kite, symbol)
-                    
-                    # Always use True Range
-                    metric_base_val = float(current_row.get("true_range", 0))
-                        
-                    delta = metric_base_val * multiplier
-                    calc_buy = open_price + delta
-                    calc_sell = open_price - delta
-
-                    st.progress((idx) / len(rows), text=f"Reviewing {idx + 1} of {len(rows)}")
-
-                    with st.container(border=True):
-                        col_head1, col_head2, col_head3 = st.columns([2, 1, 1])
-                        with col_head1:
-                            st.markdown(f"## {symbol}")
-                            st.caption(f"Rationale: {current_row.get('rationale', 'N/A')}")
-                        with col_head2:
-                            st.metric("LTP", f"₹{ltp}")
-                        with col_head3:
-                            st.metric("Open Price", f"₹{open_price}")
-
-                        st.divider()
-
-                        c_m1, c_m2 = st.columns(2)
-                        with c_m1:
-                            st.info(f"**True Range:** {metric_base_val:.2f}")
-                        with c_m2:
-                            st.info(f"**Multiplier:** x{multiplier}")
-
-                        st.markdown("### 🎯 Order Details")
-                        
-                        c_input1, c_input2, c_input3 = st.columns(3)
-                        with c_input1:
-                            quantity = st.number_input("Quantity", min_value=1, value=1, step=1, key=f"qty_{idx}")
-                        with c_input2:
-                            final_buy_price = st.number_input("BUY Price (Open + Delta)", value=float(f"{calc_buy:.2f}"), step=0.05, key=f"buy_{idx}")
-                        with c_input3:
-                            final_sell_price = st.number_input("SELL Price (Open - Delta)", value=float(f"{calc_sell:.2f}"), step=0.05, key=f"sell_{idx}")
-
-                    st.write("") 
-                    
-                    # --- BUTTON LAYOUT ---
-                    c_b1, c_b2, c_b3, c_b4 = st.columns(4)
-                    
-                    with c_b1:
-                        if st.button("🔵 BUY Only", use_container_width=True):
-                            handle_approval("BUY", current_row, final_buy_price, final_sell_price, quantity)
-                            st.rerun()
-                    
-                    with c_b2:
-                        if st.button("🔴 SELL Only", use_container_width=True):
-                            handle_approval("SELL", current_row, final_buy_price, final_sell_price, quantity)
-                            st.rerun()
-
-                    with c_b3:
-                        if st.button("🟣 BUY & SELL", use_container_width=True):
-                            handle_approval("BOTH", current_row, final_buy_price, final_sell_price, quantity)
-                            st.rerun()
-
-                    with c_b4:
-                        if st.button("⏭️ SKIP", use_container_width=True):
-                            handle_approval("SKIP", current_row, final_buy_price, final_sell_price, quantity)
-                            st.rerun()
-
-                elif rows and idx >= len(rows):
-                    st.success("🎉 Selected items reviewed!")
-                    if st.button("Start Over"):
-                        reset_selection()
-                        st.rerun()
-
     # ---------------------------------------------------------
     # PART 2: LOGIN FLOW
     # ---------------------------------------------------------

@@ -7,6 +7,7 @@ import os
 import pandas as pd
 from datetime import datetime, date
 import math
+from kite_utils import place_buy_order, place_sell_order
 
 # --- Configuration ---
 st.set_page_config(page_title="Scanner Approval", page_icon="✅")
@@ -249,11 +250,11 @@ def place_all_orders(kite_client, orders_to_place):
         
         try:
             if action in ['BUY', 'BOTH']:
-                # kite_client.place_order(transaction_type='BUY', price=buy_price, **order_details) 
+                place_buy_order(kite_client, symbol, buy_price, quantity)
                 st.toast(f"BUY: {symbol} @ ₹{buy_price} (Qty: {quantity})")
             
             if action in ['SELL', 'BOTH']:
-                # kite_client.place_order(transaction_type='SELL', price=sell_price, **order_details) 
+                place_sell_order(kite_client, symbol, sell_price, quantity)
                 st.toast(f"SELL: {symbol} @ ₹{sell_price} (Qty: {quantity})")
                 
             successful_orders.append(f"{symbol} ({action})")

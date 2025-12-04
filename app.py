@@ -183,8 +183,8 @@ def calculate_quantity_and_finalize(kite_client, selected_data, multiplier, capi
         delta = metric_base_val * multiplier
         
         # Calculate raw Buy and Sell prices
-        calc_buy = open_price + delta
-        calc_sell = open_price - delta
+        calc_buy = open_price - delta
+        calc_sell = open_price + delta
         
         # Apply rounding to 1 decimal place (multiple of 0.1) as requested
         row['open_price'] = float(f"{open_price:.2f}") 
